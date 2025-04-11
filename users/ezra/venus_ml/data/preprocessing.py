@@ -17,7 +17,7 @@ def standardize(df: pd.DataFrame, mean: Optional[pd.Series] = None,
     """
     assert type(mean) is type(std), "mean and std should both be pd.Series or both be None"
     if mean is None:
-        mean, std = df.min(), df.max()
+        mean, std = df.mean(), df.std()
     scaled_df = (df - mean) / std
     return scaled_df, (mean, std)
 
@@ -95,10 +95,16 @@ def generate_lag_fn(lag_steps: int) -> Callable[[pd.DataFrame], pd.DataFrame]:
         A new function that creates lag features up to a specified number of lag features
     """
     def create_lag_features(df: pd.DataFrame) -> pd.DataFrame:
+        lagged_columns = []
         for lag in range(1, lag_steps + 1):
             for col in df:
-                df[f"{col}_lag_{lag}"] = df[col].shift(lag)
-        return df
+                lagged_col = df[col].shift(lag)
+                lagged_col.name = f"{col}_lag_{lag}"
+                lagged_columns.append(lagged_col)
+
+        # Concatenate the original DataFrame with the new lagged columns
+        df_with_lags = pd.concat([df] + lagged_columns, axis=1)
+        return df_with_lags
     return create_lag_features
 
 

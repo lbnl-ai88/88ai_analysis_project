@@ -1,9 +1,10 @@
-from typing import List, Optional, Union, Sequence, Tuple, Callable
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
+import copy
 from sklearn.model_selection import train_test_split
+from typing import List, Optional, Union, Sequence, Tuple, Callable
 
 
 def read_file(file_path: str):
@@ -26,9 +27,9 @@ def read_file(file_path: str):
         raise ValueError(f"Invalid file type: {file_path}. File must be a .csv or .parquet file")
 
 
-def run_select(df: pd.DataFrame, run_selection: Union[int, float, Sequence[Union[int, float]]]) -> pd.DataFrame:
+def run_select(df: pd.DataFrame, run_selection: Union[int, float, Sequence[Union[int, float, str]]]) -> pd.DataFrame:
     """
-    Select the desired runs for the dataset
+    Select the desired runs for the dataset. Runs should be in column 'run_id'.
     Args:
         df (pd.DataFrame): Full dataset
         run_selection (Union[float, Sequence[float]]): desired runs
@@ -39,12 +40,12 @@ def run_select(df: pd.DataFrame, run_selection: Union[int, float, Sequence[Union
     Raises:
         ValueError: if an invalid form of run selection is inputted
     """
-    if type(run_selection) in [int, float]:
+    if type(run_selection) in [int, float, str]:
         mask = df["run_id"] == run_selection
     elif type(run_selection) in [list, tuple]:
         mask = df["run_id"].isin(run_selection)
     else:
-        raise ValueError(f"Invalid run selection: {run_selection}. Must be int, float, Sequence[Union[float, int]]")
+        raise ValueError(f"Invalid run selection: {run_selection}. Must be int, float, str Sequence[Union[float, int, str]]")
     return df[mask]
 
 
@@ -70,7 +71,7 @@ class VenusDataset(Dataset):
                  file_path: str,
                  input_columns: List[str],
                  output_columns: List[str],
-                 run_selection: Union[int, float, Sequence[float]] = None,
+                 run_selection: Union[int, float, str, Sequence] = None,
                  scaler: Callable[[pd.DataFrame, Optional[pd.Series], Optional[pd.Series]], Tuple[pd.DataFrame, Tuple[pd.Series, pd.Series]]] = None,
                  transforms: Sequence[Callable[[pd.DataFrame], pd.DataFrame]] = None,
                  sequence_length: int = 0
@@ -88,7 +89,6 @@ class VenusDataset(Dataset):
             transforms (Sequence[Callable[[pd.DataFrame], pd.DataFrame]]): list of transform functions
             sequence_length (int): length of sequence to return
         """
-        # TODO fix issue where standardizing scales run_id columns so cant be referenced
         self.df = read_file(file_path)
         if run_selection:
             self.df = run_select(self.df, run_selection)
@@ -105,20 +105,30 @@ class VenusDataset(Dataset):
         self.outputs = self.df[output_columns].fillna(0)
 
     def __len__(self) -> int:
-        return len(self.df) - self.sequence_length
+        return len(self.inputs) - self.sequence_length
 
     def dataset_size(self) -> int:
-        return len(self.df)
+        return len(self.inputs)
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
-        inputs = self.inputs.iloc[idx:idx + self.sequence_length] if self.sequence_length else self.inputs.iloc[idx]
-        outputs = self.outputs.iloc[idx + self.sequence_length] if self.sequence_length else self.outputs.iloc[idx]
+        if self.sequence_length:
+            inputs = self.inputs.iloc[idx:idx + self.sequence_length]
+            outputs = self.outputs.iloc[idx + self.sequence_length]
+        else:
+            inputs = self.inputs.iloc[idx]
+            outputs = self.outputs.iloc[idx]
 
-        inputs = torch.tensor(inputs.values, dtype=torch.float32)
-        outputs = torch.tensor(outputs.values, dtype=torch.float32)
+        # Convert inputs and outputs to numeric values
+        inputs = pd.DataFrame(inputs).apply(pd.to_numeric, errors='coerce').fillna(0).values
+        outputs = pd.DataFrame(outputs).apply(pd.to_numeric, errors='coerce').fillna(0).values
+
+        inputs = torch.tensor(inputs, dtype=torch.float32)
+        outputs = torch.tensor(outputs, dtype=torch.float32)
+        inputs = inputs.squeeze()
+        outputs = outputs.squeeze()
 
         return inputs, outputs
 
@@ -166,55 +176,93 @@ class VenusDataset(Dataset):
         inputs, outputs = self.to_numpy()
         return torch.tensor(inputs, dtype=torch.float32), torch.tensor(outputs, dtype=torch.float32)
 
-    def get_runs(self, run_ids: Sequence[Union[float, int]]) -> dict:
+    def get_runs(self, run_ids: Sequence[Union[float, int, str]]) -> dict:
         """
-        Retrieves a dictionary of run_ids paired with corresponding data as numpy arrays
+        Retrieves a dictionary of run_ids paired with corresponding data as pandas DataFrames
         Args:
-            run_ids (Sequence[Union[float, int]]): Which runs to select
+            run_ids (Sequence[Union[float, int, str]]): Which runs to select
 
         Returns:
-            A dictionary containing run_ids paired with corresponding data
+            A dictionary containing run_ids paired with corresponding DataFrame slices
         """
         runs_data = {}
         for run_id in run_ids:
-            run_df = self.df[self.df["run_id"] == run_id]
+            run_df = run_select(self.df, run_id)
             input_columns = [col for col in run_df.columns if col in self.inputs.columns]
             output_columns = [col for col in run_df.columns if col in self.outputs.columns]
-            runs_data[run_id] = (run_df[input_columns].to_numpy(), run_df[output_columns].to_numpy())
+            runs_data[run_id] = (run_df[input_columns], run_df[output_columns])
         return runs_data
 
-    def get_run_splits(self, run_ids: Sequence[Union[float]], validation_size: Optional[float] = 0.2,
-                       random_state: Optional[int] = None, shuffle=True) -> Tuple:
+    def generate_splits(self, run_ids: Sequence[Union[int, float, str]],
+                        validation_size: Optional[float] = 0.2,
+                        random_state: Optional[int] = None, shuffle=True) -> Tuple:
         """
         Retrieves runs data and splits into training and validation sets with the split occurring in each run
-        individually
+        individually, returning modified copies of the original dataset for training and validation.
         Args:
+            original_dataset: An instance of VenusDataset to be copied and modified
             run_ids (Sequence): Which runs to select
             validation_size (float): Which percentage of data to make validation
             random_state (int): Optional parameter to set random state, defaults to None
             shuffle (bool): Whether to shuffle the run before splitting, defaults to True
 
         Returns:
-            Tuple of numpy arrays containing
-            (train_input, train_output, validation_input, validation_output)
+            Tuple of VenusDataset objects containing (training_dataset, validation_dataset)
         """
-        X_train_list, X_val_list, y_train_list, y_val_list = [], [], [], []
+        train_inputs_list, val_inputs_list, train_outputs_list, val_outputs_list = [], [], [], []
         runs_data = self.get_runs(run_ids)
         for run_id, (inputs, outputs) in runs_data.items():
-            X_train, X_val, y_train, y_val = train_test_split(
-                inputs, outputs, test_size=validation_size, random_state=random_state, shuffle=shuffle
+            x_train, x_val, y_train, y_val = train_test_split(
+                inputs,
+                outputs,
+                test_size=validation_size,
+                random_state=random_state,
+                shuffle=shuffle
             )
-            X_train_list.append(X_train)
-            X_val_list.append(X_val)
-            y_train_list.append(y_train)
-            y_val_list.append(y_val)
+            train_inputs_list.append(x_train)
+            val_inputs_list.append(x_val)
+            train_outputs_list.append(y_train)
+            val_outputs_list.append(y_val)
 
-        train_inputs = np.concatenate(X_train_list, axis=0)
-        validation_inputs = np.concatenate(X_val_list, axis=0)
-        train_outputs = np.concatenate(y_train_list, axis=0)
-        validation_outputs = np.concatenate(y_val_list, axis=0)
+        # Combine all training and validation splits
+        train_inputs = pd.concat(train_inputs_list, ignore_index=True)
+        validation_inputs = pd.concat(val_inputs_list, ignore_index=True)
+        train_outputs = pd.concat(train_outputs_list, ignore_index=True)
+        validation_outputs = pd.concat(val_outputs_list, ignore_index=True)
 
-        return train_inputs, train_outputs, validation_inputs, validation_outputs
+        # Create deep copies of the original dataset and update inputs and outputs
+        training_dataset = copy.deepcopy(self)
+        training_dataset.inputs = train_inputs
+        training_dataset.outputs = train_outputs
+
+        validation_dataset = copy.deepcopy(self)
+        validation_dataset.inputs = validation_inputs
+        validation_dataset.outputs = validation_outputs
+
+        return training_dataset, validation_dataset
+
+    def get_data_loaders(self, run_ids: Sequence[Union[int, float, str]], batch_size: int = 32,
+                         validation_size: Optional[float] = 0.2, random_state: Optional[int] = None, shuffle=True) -> (
+            Tuple)[DataLoader, DataLoader]:
+        """
+        Returns DataLoaders for training and validation datasets.
+
+        Args:
+            run_ids (Sequence[Union[int, float, str]]): Which runs to select
+            batch_size (int): Number of samples per batch to load
+            validation_size (float): Which percentage of data to make validation
+            random_state (int): Optional parameter to set random state, defaults to None
+            shuffle (bool): Whether to shuffle the run before splitting, defaults to True
+
+        Returns:
+            Tuple of DataLoader objects containing (training_loader, validation_loader)
+        """
+        training_dataset, validation_dataset = self.generate_splits(run_ids, validation_size, random_state, shuffle)
+
+        training_loader = DataLoader(training_dataset, batch_size=batch_size, shuffle=shuffle)
+        validation_loader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=False)
+
+        return training_loader, validation_loader
 
 
 
