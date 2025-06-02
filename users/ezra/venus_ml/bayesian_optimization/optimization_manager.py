@@ -6,6 +6,7 @@ from bayes_opt import BayesianOptimization
 from bayes_opt.acquisition import ExpectedImprovement, UpperConfidenceBound  # Import specific acquisitions
 from tqdm.notebook import tqdm  # Import tqdm for notebook progress bars
 import copy # To deep copy acquisition function if needed
+import math # For ceil
 
 # --- Assume generator functions are defined elsewhere ---
 # generate_styblinski_tang, generate_shifted_noisy_gaussian, etc.
@@ -18,64 +19,45 @@ class BayesOptimizer:
     """
 
     def __init__(self, func, pbounds,
-                 known_true_max=None, # New parameter
+                 known_true_max=None,
                  early_stopping_threshold=0.01, early_stopping_patience=5,
                  random_state=None, verbose=True, plot_dir=None):
         """
         Initializes the Bayesian Optimizer setup.
-
-        Args:
-            func (callable): The objective function to maximize.
-            pbounds (dict): Parameter bounds {'param': (low, high), ...}.
-            known_true_max (float, optional): If the true maximum value of the
-                function is known, provide it here to bypass random sampling
-                approximation and use it for comparisons/early stopping. Defaults to None.
-            early_stopping_threshold (float): Stop if % diff from comparison max
-                is below this threshold. Defaults to 0.01 (1%).
-            early_stopping_patience (int): Number of consecutive iterations
-                meeting the threshold to trigger stopping. Defaults to 5.
-            random_state (int, optional): Seed for reproducibility of runs.
-            verbose (bool): If True, enables print statements and progress bars.
-                            Defaults to True.
-            plot_dir (str, optional): Directory to save plots in. If None, defaults
-                                      to 'toy_bayes'. Defaults to None.
+        (Constructor code remains the same as your provided version)
         """
         self.plot_dir = plot_dir if plot_dir is not None else "toy_bayes"
         self.func = func
         self.pbounds = pbounds
         self.dim = len(pbounds)
-        self.known_true_max = known_true_max # Store if provided
+        self.known_true_max = known_true_max
         self.early_stopping_threshold = early_stopping_threshold
         self.early_stopping_patience = early_stopping_patience
         self.random_state = random_state
         self.verbose = verbose
-
-        # --- Results Storage ---
         self.iteration_data = {}
         self.best_params_history = []
         self.best_value_history = []
         self.current_best_value = -np.inf
         self.current_best_params = None
         self.stopped_early = False
-        # This will hold either the known_true_max or the sampled approx max
         self.comparison_max = known_true_max
-        self.sampled_approx_max = None # Store sampled value separately if calculated
+        self.sampled_approx_max = None
         self.total_iterations = 0
         self.last_run_acquisition_fn = None
         self.last_run_n_random = 0
         self.last_run_n_acq_max = 0
         self._last_optimizer_instance = None
+        self._color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
     # --- (_sanitize_filename, _get_acq_info, _generate_filename, _ensure_dir_exists unchanged) ---
     def _sanitize_filename(self, name):
-        """Removes potentially problematic characters for filenames."""
         name = str(name); name = re.sub(r'\s+', '_', name)
         name = re.sub(r'[^\w.\-]+', '', name); name = name.strip('._-')
         if not name or name in ['.', '..']: return "plot"
         return name
 
     def _get_acq_info(self, acq_fn):
-        """Extracts name and key parameter from acquisition function."""
         if acq_fn is None: return "N/A", ""
         name = type(acq_fn).__name__; param_str = ""
         if hasattr(acq_fn, 'xi'): param_str = f"xi{acq_fn.xi:.2f}".replace('.', 'p')
@@ -83,7 +65,6 @@ class BayesOptimizer:
         return name, param_str
 
     def _generate_filename(self, base_name=None, prefix="bayesopt", directory=None):
-        """Generates a descriptive filename within the specified directory."""
         target_directory = directory if directory is not None else self.plot_dir
         if base_name:
             sanitized_base = self._sanitize_filename(base_name)
@@ -103,7 +84,6 @@ class BayesOptimizer:
         return full_path
 
     def _ensure_dir_exists(self, filename):
-        """Checks if the directory for the filename exists, creates if not."""
         directory = os.path.dirname(filename)
         if directory and not os.path.exists(directory):
             try:
@@ -114,8 +94,8 @@ class BayesOptimizer:
                 return False
         return True
 
+    # --- (_approximate_function_max, _run_single_optimization, run_experiment unchanged) ---
     def _approximate_function_max(self, n_samples=10_000, seed=None):
-        """Approximates the true maximum via random sampling. Sets self.sampled_approx_max."""
         if self.verbose: print(f"Approximating true maximum using {n_samples} random samples...")
         rng = np.random.default_rng(seed if seed is not None else self.random_state)
         max_val = -np.inf
@@ -129,14 +109,12 @@ class BayesOptimizer:
                 continue
         if np.isinf(max_val):
             if self.verbose: print("Warning: Approximation of true maximum failed or yielded -inf.")
-            self.sampled_approx_max = None # Indicate failure
+            self.sampled_approx_max = None
         else:
-            self.sampled_approx_max = max_val # Store the sampled value
+            self.sampled_approx_max = max_val
             if self.verbose: print(f"Sampled Approx Max: {self.sampled_approx_max:.6f}")
-        # Do not overwrite self.comparison_max here if it was set by known_true_max
 
     def _run_single_optimization(self, acquisition_fn, n_random, n_acq_max, run_seed):
-        """Internal method to run one optimization sequence with progress bars."""
         local_iteration_data = {}
         local_best_params_history = []
         local_best_value_history = []
@@ -144,14 +122,11 @@ class BayesOptimizer:
         local_current_best_params = None
         local_stopped_early = False
         local_total_iterations = 0
-
         optimizer = BayesianOptimization(
             f=None, acquisition_function=acquisition_fn, pbounds=self.pbounds,
             verbose=0, random_state=run_seed
         )
         rng_run = np.random.default_rng(run_seed)
-
-        # --- Random Burn-in Phase ---
         random_iterator = range(n_random)
         if self.verbose: random_iterator = tqdm(random_iterator, desc="Random Exploration", leave=False)
         for i in random_iterator:
@@ -169,8 +144,6 @@ class BayesOptimizer:
             local_iteration_data[local_total_iterations] = {'x': list(random_point.values()), 'y': y_val, 'mu': mu, 'sigma': sigma, 'random': True}
             local_best_value_history.append(local_current_best_value); local_best_params_history.append(local_current_best_params)
             local_total_iterations += 1
-
-        # --- Acquisition-driven Phase ---
         consecutive_threshold_met = 0
         acq_iterator = range(n_acq_max)
         if self.verbose: acq_iterator = tqdm(acq_iterator, desc="Acquisition Phase ", leave=False)
@@ -197,23 +170,16 @@ class BayesOptimizer:
             local_iteration_data[local_total_iterations] = {'x': list(next_point.values()), 'y': y_val, 'mu': mu, 'sigma': sigma, 'random': False}
             local_best_value_history.append(local_current_best_value); local_best_params_history.append(local_current_best_params)
             local_total_iterations += 1
-
-            # --- Early Stopping Check (using self.comparison_max) ---
-            # Ensure comparison_max is valid before checking
             if self.comparison_max is not None and not np.isinf(self.comparison_max):
-                denom = abs(self.comparison_max)
-                diff_percentage = abs(self.comparison_max - local_current_best_value) / denom if denom > 1e-9 else abs(self.comparison_max - local_current_best_value)
+                denom = abs(self.comparison_max); diff_percentage = abs(self.comparison_max - local_current_best_value) / denom if denom > 1e-9 else abs(self.comparison_max - local_current_best_value)
                 if diff_percentage < self.early_stopping_threshold: consecutive_threshold_met += 1
                 else: consecutive_threshold_met = 0
                 if consecutive_threshold_met >= self.early_stopping_patience:
                     local_stopped_early = True
                     if self.verbose and isinstance(acq_iterator, tqdm): acq_iterator.set_description("Acquisition Phase (Stopped Early)", refresh=True)
                     break
-            # --- End Early Stopping Check ---
-
         return (local_iteration_data, local_best_value_history, local_best_params_history,
                 local_stopped_early, local_total_iterations, optimizer)
-
 
     def run_experiment(self, acquisition_fn, n_random=5, n_acq_max=50,
                        approx_max_samples=10_000, plot_summary=True, verbose=None,
@@ -221,48 +187,28 @@ class BayesOptimizer:
         """Runs a single Bayesian optimization experiment with progress bars."""
         effective_verbose = verbose if verbose is not None else self.verbose
         original_verbose = self.verbose; self.verbose = effective_verbose
-
-        # --- Reset state ---
         self.iteration_data = {}; self.best_params_history = []; self.best_value_history = []
         self.current_best_value = -np.inf; self.current_best_params = None
         self.stopped_early = False; self.total_iterations = 0
         self.last_run_acquisition_fn = acquisition_fn
         self.last_run_n_random = n_random; self.last_run_n_acq_max = n_acq_max
-        self._last_optimizer_instance = None
-        self.sampled_approx_max = None # Reset sampled max for this run
-
-        # --- Set Comparison Maximum ---
-        if self.comparison_max is None: # Only approximate if not provided via known_true_max
+        self._last_optimizer_instance = None; self.sampled_approx_max = None
+        if self.comparison_max is None:
             self._approximate_function_max(n_samples=approx_max_samples, seed=self.random_state)
-            # If sampling failed, we cannot proceed with comparison/early stopping
             if self.sampled_approx_max is None:
-                 if effective_verbose: print("Approximation failed. Cannot proceed with comparison/early stopping.")
-                 # Decide how to handle: maybe disable early stopping? For now, stop run.
+                 if effective_verbose: print("Approximation failed. Cannot proceed.")
                  self.verbose = original_verbose; return {}
-            else:
-                 # Use the sampled value for comparison in this run
-                 self.comparison_max = self.sampled_approx_max
-        elif effective_verbose:
-             # comparison_max was already set from known_true_max
-             print(f"Using known true maximum for comparison: {self.comparison_max:.6f}")
-
-        # --- Run Optimization ---
+            else: self.comparison_max = self.sampled_approx_max
+        elif effective_verbose: print(f"Using known true maximum for comparison: {self.comparison_max:.6f}")
         if effective_verbose:
             print(f"\nStarting single optimization run: {n_random} random, max {n_acq_max} acquisition steps.")
             acq_name, acq_param = self._get_acq_info(acquisition_fn)
             print(f"Using Acquisition Function: {acq_name} ({acq_param})")
-
-        run_results = self._run_single_optimization(
-            acquisition_fn=acquisition_fn, n_random=n_random,
-            n_acq_max=n_acq_max, run_seed=self.random_state
-        )
+        run_results = self._run_single_optimization(acquisition_fn, n_random, n_acq_max, self.random_state)
         (self.iteration_data, self.best_value_history, self.best_params_history,
          self.stopped_early, self.total_iterations, self._last_optimizer_instance) = run_results
-
         if self.best_value_history: self.current_best_value, self.current_best_params = self.best_value_history[-1], self.best_params_history[-1]
         else: self.current_best_value, self.current_best_params = -np.inf, None
-
-        # --- Final Report ---
         if effective_verbose:
             print("\n--- Single Run Finished ---")
             status = f"stopped early after {self.total_iterations}" if self.stopped_early else f"finished after {self.total_iterations}"
@@ -274,32 +220,23 @@ class BayesOptimizer:
                      gp_max_val_str = f"{gp_max_val:.6f}" if isinstance(gp_max_val, (float, np.float_)) else str(gp_max_val)
                      print(f"Best value found (GP Max):   {gp_max_val_str}")
                 print(f"Best parameters found: {self.current_best_params}")
-                # Report difference based on the comparison max used (known or sampled)
                 comparison_type = "Known True Max" if self.known_true_max is not None else "Sampled Approx Max"
                 if self.comparison_max is not None:
                     final_diff = abs(self.comparison_max - self.current_best_value)
                     final_diff_perc = (final_diff / abs(self.comparison_max) * 100 if abs(self.comparison_max) > 1e-9 else final_diff * 100)
                     print(f"Difference from {comparison_type} ({self.comparison_max:.6f}): {final_diff:.6f} ({final_diff_perc:.4f}%)")
-                else:
-                    print("Comparison maximum not available for difference calculation.")
+                else: print("Comparison maximum not available.")
             else: print("No valid points evaluated.")
             print("-" * 27)
-
-        # --- Plotting ---
         if plot_summary and self.iteration_data:
             self.plot_summary(save_plot=save_plot, save_filename=save_filename)
-
-        # --- Reset comparison_max if it came from sampling ---
-        if self.known_true_max is None:
-            self.comparison_max = None
-
-        self.verbose = original_verbose # Restore original verbosity
+        if self.known_true_max is None: self.comparison_max = None
+        self.verbose = original_verbose
         return self.iteration_data
 
     # --- Static Aggregation Methods (_aggregate_iteration_data, _aggregate_best_history unchanged) ---
     @staticmethod
     def _aggregate_iteration_data(data_list, verbose=True):
-        """Averages iteration data across multiple runs."""
         if not data_list: return {}
         valid_data_list = [d for d in data_list if d]
         if not valid_data_list:
@@ -335,7 +272,6 @@ class BayesOptimizer:
 
     @staticmethod
     def _aggregate_best_history(history_list):
-        """Averages the best-value-so-far history across runs."""
         valid_histories = [h for h in history_list if h];
         if not valid_histories: return []
         min_len = min(len(h) for h in valid_histories);
@@ -344,34 +280,39 @@ class BayesOptimizer:
         avg_history = np.nanmean(stacked_histories, axis=0)
         return avg_history.tolist()
 
-    # --- run_acquisition_sweep (only needs minor change for comparison_max handling) ---
+    # --- run_acquisition_sweep (Modified Plotting Section) ---
     def run_acquisition_sweep(self, acq_param_dict, acquisition_fn_constructor,
                               n_random=5, n_acq_max=50, num_runs=3,
                               approx_max_samples=10_000,
                               title="Acquisition Parameter Sweep", verbose=None,
-                              save_plot=False, save_filename=None):
+                              save_plot=False, save_filename=None, plot_cols=3): # Added plot_cols
         effective_verbose = verbose if verbose is not None else self.verbose
         original_verbose = self.verbose; self.verbose = effective_verbose
         if len(acq_param_dict) != 1: raise ValueError("acq_param_dict must contain exactly one key.")
         param_name, param_values = list(acq_param_dict.items())[0]
         num_params = len(param_values)
 
-        # --- Set Comparison Maximum (Once for the sweep) ---
-        # Store original comparison_max in case it was known
         original_comparison_max = self.comparison_max
-        if self.comparison_max is None: # Only approximate if not provided
+        if self.comparison_max is None:
             self._approximate_function_max(n_samples=approx_max_samples, seed=self.random_state)
             if self.sampled_approx_max is None:
                  if effective_verbose: print("Approximation failed. Cannot proceed with sweep.")
                  self.verbose = original_verbose; return {}
-            else:
-                 self.comparison_max = self.sampled_approx_max # Use sampled for the sweep
-        elif effective_verbose:
-             print(f"Using known true maximum for comparison: {self.comparison_max:.6f}")
+            else: self.comparison_max = self.sampled_approx_max
+        elif effective_verbose: print(f"Using known true maximum for comparison: {self.comparison_max:.6f}")
 
-        # --- Proceed with sweep logic ---
-        fig, axs = plt.subplots(num_params, 2, figsize=(16, 6 * num_params), squeeze=False)
+        # --- Setup Plot Grid ---
+        n_plots_per_param = self.dim + 1 # dim feature plots + 1 performance plot
+        n_cols = min(plot_cols, n_plots_per_param)
+        n_rows_per_param = math.ceil(n_plots_per_param / n_cols)
+        total_rows = num_params * n_rows_per_param
+
+        fig, axs = plt.subplots(total_rows, n_cols,
+                                figsize=(6 * n_cols, 4.5 * total_rows), # Adjusted figsize
+                                squeeze=False)
         sweep_results = {}
+
+        # --- Main Sweep Loop ---
         for i, param_value in enumerate(param_values):
             if effective_verbose: print(f"\n--- Running Sweep: {param_name} = {param_value} ({num_runs} runs) ---")
             run_iteration_data_list, run_best_value_history_list = [], []
@@ -384,25 +325,67 @@ class BayesOptimizer:
                     if effective_verbose: print(f"\nError creating acquisition function: {e}. Skipping runs.")
                     run_iteration_data_list.append(None); run_best_value_history_list.append(None)
                     continue
-                # Ignore optimizer instance from tuple
                 run_results_tuple = self._run_single_optimization(acq_fn, n_random, n_acq_max, run_seed)
                 run_iteration_data_list.append(run_results_tuple[0]); run_best_value_history_list.append(run_results_tuple[1])
+
+            # --- Aggregation ---
             if effective_verbose: print(f"Aggregating results for {param_name} = {param_value}...")
             agg_data = self._aggregate_iteration_data(run_iteration_data_list, verbose=effective_verbose)
             agg_best_history = self._aggregate_best_history(run_best_value_history_list)
             sweep_results[param_value] = {'agg_iteration_data': agg_data, 'agg_best_value_history': agg_best_history}
+
+            # --- Plotting for this Parameter Value ---
             if not agg_data:
                  if effective_verbose: print(f"No aggregated data to plot for {param_name}={param_value}.")
-                 axs[i, 0].set_title(f"{param_name}={param_value} (No Data)"); axs[i, 1].set_title(f"{param_name}={param_value} (No Data)")
-                 axs[i, 0].axis('off'); axs[i, 1].axis('off')
+                 # Optionally turn off axes for this parameter's rows
+                 start_row_idx = i * n_rows_per_param
+                 for row_offset in range(n_rows_per_param):
+                     for col_idx in range(n_cols):
+                         axs[start_row_idx + row_offset, col_idx].axis('off')
                  continue
-            # Pass the comparison_max determined for the sweep to plotting
-            self._plot_feature_evolution_data(agg_data, axs[i, 0], title_suffix=f"({param_name}={param_value}, Avg over {num_runs} runs)")
-            self._plot_performance_vs_max_data(agg_best_history, self.comparison_max, axs[i, 1], title_suffix=f"({param_name}={param_value}, Avg over {num_runs} runs)")
+
+            # Plot averaged feature evolution and performance
+            title_suffix = f"({param_name}={param_value}, Avg over {num_runs} runs)"
+            start_row_idx = i * n_rows_per_param # Starting row for this parameter value
+
+            for plot_idx in range(n_plots_per_param):
+                current_row = start_row_idx + (plot_idx // n_cols)
+                current_col = plot_idx % n_cols
+                ax = axs[current_row, current_col]
+
+                if plot_idx < self.dim: # Feature plot
+                    self._plot_averaged_feature_evolution(
+                        agg_data=agg_data,
+                        feature_index=plot_idx,
+                        ax=ax,
+                        title_suffix=title_suffix
+                    )
+                else: # Performance plot (last plot in the sequence)
+                    self._plot_performance_vs_max_data(
+                        best_value_history=agg_best_history,
+                        comparison_max=self.comparison_max,
+                        ax=ax,
+                        title_suffix=title_suffix
+                    )
+
+            # Add a Row Label / Separator (using text on the first plot of the row)
+            row_label = f"{param_name} = {param_value}"
+            axs[start_row_idx, 0].text(-0.1, 1.15, row_label, transform=axs[start_row_idx, 0].transAxes,
+                                       fontsize=14, fontweight='bold', ha='left', va='top')
+
+            # Turn off any unused axes in the last row for this parameter
+            last_plot_idx = n_plots_per_param - 1
+            last_row_idx = start_row_idx + (last_plot_idx // n_cols)
+            plots_in_last_row = (last_plot_idx % n_cols) + 1
+            for unused_col in range(plots_in_last_row, n_cols):
+                 axs[last_row_idx, unused_col].axis('off')
+
 
         # --- Final Plot Adjustments and Saving ---
-        fig.suptitle(title, fontsize=18)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+        fig.suptitle(title, fontsize=18, y=1.0) # Adjust y if needed
+        plt.tight_layout(rect=[0, 0.02, 1, 0.97]) # Adjust top/bottom margins
+        # fig.subplots_adjust(hspace=0.4, wspace=0.3) # Optional manual spacing
+
         if save_plot:
             if save_filename is None:
                 try: func_name = self.func.__name__
@@ -421,49 +404,81 @@ class BayesOptimizer:
                  if effective_verbose: print(f"Could not save plot, directory creation failed for {full_filename}")
         plt.show()
 
-        # --- Restore original comparison_max if it was known ---
         self.comparison_max = original_comparison_max
-        # Reset sampled max just in case
         self.sampled_approx_max = None
-
         self.verbose = original_verbose
         return sweep_results
 
 
     # --- Plotting Methods ---
-    # (_plot_feature_evolution_data, plot_feature_evolution unchanged)
-    def _plot_feature_evolution_data(self, iteration_data, ax, title_suffix=""):
-        """Plots feature evolution using provided data and axes."""
+
+    def _plot_single_feature_convergence(self, iteration_data, feature_index, optimal_value, ax, title_suffix=""):
+        """Plots the evolution of a single feature against its optimal value."""
         if not iteration_data: return
         all_iterations = sorted(iteration_data.keys());
         if not all_iterations: return
-        X = np.array([iteration_data[i]['x'] for i in all_iterations])
-        if np.isnan(X).all():
-            if self.verbose: ax.text(0.5, 0.5, 'No valid feature data', ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(f"Feature Evolution {title_suffix}"); return
-        n_iters, dim = X.shape
-        with np.errstate(invalid='ignore'): mins, maxs = np.nanmin(X, axis=0), np.nanmax(X, axis=0)
-        ranges = maxs - mins; ranges[ranges < 1e-9] = 1.0; X_scaled = (X - mins) / ranges
-        switch_index = -1
+        feature_values = [iteration_data[i]['x'][feature_index] for i in all_iterations]
+        feature_name = f"x{feature_index}"
+        color = self._color_cycle[feature_index % len(self._color_cycle)]
+        switch_iter = -1
         for i in all_iterations:
-            if 'random' in iteration_data[i] and not iteration_data[i]['random']: switch_index = i; break
-        for d in range(dim): ax.scatter(all_iterations, X_scaled[:, d], label=f"x{d}", s=10, alpha=0.7)
-        if switch_index != -1 and switch_index > 0: ax.axvline(switch_index - 0.5, color='black', linestyle='--', label="Switch")
-        ax.set_xlabel("Iteration"); ax.set_ylabel("Scaled Feature Value"); ax.set_title(f"Feature Evolution {title_suffix}")
-        ax.legend(fontsize='small', loc='best'); ax.grid(True, axis='y', linestyle=':')
-        ax.set_ylim(-0.1, 1.1)
+            if not iteration_data[i]['random']: switch_iter = i; break
+        ax.scatter(all_iterations, feature_values, s=10, alpha=0.6, label="Sampled Values", c=color)
+        if optimal_value is not None: ax.axhline(optimal_value, color='red', linestyle='--', linewidth=2, label=f"Optimal ({optimal_value:.3f})")
+        if switch_iter != -1 and switch_iter > 0: ax.axvline(switch_iter - 0.5, color='black', linestyle=':', linewidth=1.5, label="Switch")
+        ax.set_xlabel("Iteration"); ax.set_ylabel(f"{feature_name} Value")
+        ax.set_title(f"Convergence of {feature_name} {title_suffix}")
+        ax.legend(fontsize='small', loc='best'); ax.grid(True, linestyle=':')
+        if feature_name in self.pbounds:
+             lower_b, upper_b = self.pbounds[feature_name]; margin = (upper_b - lower_b) * 0.05
+             ax.set_ylim(lower_b - margin, upper_b + margin)
 
-    def plot_feature_evolution(self, ax=None):
-        """Plots feature evolution for the last run stored in `self`."""
-        if not self.iteration_data:
-            if self.verbose: print("No iteration data available from the last run.")
-            return
-        if ax is None: fig, ax = plt.subplots(figsize=(10, 5)); show_plot = True
-        else: show_plot = False
-        self._plot_feature_evolution_data(self.iteration_data, ax, title_suffix="(Last Run)")
-        if show_plot: plt.tight_layout(); plt.show()
+    def _plot_averaged_feature_evolution(self, agg_data, feature_index, ax, title_suffix=""):
+        """Plots the averaged evolution of a single feature."""
+        if not agg_data: return
+        all_iterations = sorted(agg_data.keys())
+        if not all_iterations: return
 
-    # Modify performance plot to use comparison_max
+        # Extract averaged values, handling potential NaNs
+        feature_values = []
+        valid_iterations = []
+        for i in all_iterations:
+            val = agg_data[i]['x'][feature_index]
+            if not np.isnan(val):
+                feature_values.append(val)
+                valid_iterations.append(i)
+
+        if not valid_iterations: # No valid data points for this feature
+             if self.verbose: ax.text(0.5, 0.5, 'No valid avg data', ha='center', va='center', transform=ax.transAxes)
+             ax.set_title(f"Avg Convergence of x{feature_index} {title_suffix}"); return
+
+        feature_name = f"x{feature_index}"
+        color = self._color_cycle[feature_index % len(self._color_cycle)]
+
+        # Find switch point based on aggregated random flag
+        switch_iter = -1
+        for i in all_iterations: # Check all original iterations for the flag
+            if i in agg_data and not agg_data[i]['random']:
+                switch_iter = i
+                break
+
+        # Plot averaged sampled values
+        ax.scatter(valid_iterations, feature_values, s=10, alpha=0.6, label="Avg Sampled Values", c=color)
+
+        # Plot switch line
+        if switch_iter != -1 and switch_iter > 0:
+            ax.axvline(switch_iter - 0.5, color='black', linestyle=':', linewidth=1.5, label="Switch")
+
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel(f"Avg Feature {feature_name} Value")
+        ax.set_title(f"Avg Convergence of {feature_name} {title_suffix}")
+        ax.legend(fontsize='small', loc='best')
+        ax.grid(True, linestyle=':')
+        if feature_name in self.pbounds:
+             lower_b, upper_b = self.pbounds[feature_name]; margin = (upper_b - lower_b) * 0.05
+             ax.set_ylim(lower_b - margin, upper_b + margin)
+
+
     def _plot_performance_vs_max_data(self, best_value_history, comparison_max, ax, title_suffix=""):
         """Plots performance vs the comparison maximum (known or sampled)."""
         if not best_value_history or comparison_max is None or np.isinf(comparison_max):
@@ -478,84 +493,79 @@ class BayesOptimizer:
             perc_diffs.append(perc)
         ax.plot(all_iterations, perc_diffs, marker='.', linestyle='-', color='red')
         ax.set_xlabel("Iteration"); ax.set_ylabel("Difference from Comparison Max (%)")
-        # Update title to use the actual comparison value
         ax.set_title(f"Performance vs Comparison Max ({comparison_max:.4f}) {title_suffix}")
-        ax.set_ylim(-0.1, 101)
+        ax.set_ylim(-1, 101)
         ax.grid(True, linestyle=':')
 
-    def plot_performance_vs_max(self, ax=None):
-        """Plots performance vs comparison max for the last run stored in `self`."""
-        if not self.best_value_history or self.comparison_max is None:
-            if self.verbose: print("Performance data not available from the last run.")
-            return
-        if ax is None: fig, ax = plt.subplots(figsize=(10, 5)); show_plot = True
-        else: show_plot = False
-        # Pass self.comparison_max
-        self._plot_performance_vs_max_data(self.best_value_history, self.comparison_max, ax, title_suffix="(Last Run)")
-        if show_plot: plt.tight_layout(); plt.show()
-
-
-    def plot_summary(self, save_plot=False, save_filename=None):
+    def plot_summary(self, save_plot=False, save_filename=None, plot_cols=3):
         """
-        Generates a 1x2 summary plot for the last single run, including max value comparison.
+        Generates a summary plot for the last single run. Shows individual feature
+        convergence plots (with optimal line) and the performance vs max plot.
         """
         if not self.iteration_data:
             if self.verbose: print("No data available from the last run to generate summary plot.")
             return
+        if not self._last_optimizer_instance or not hasattr(self._last_optimizer_instance, 'max') or not self._last_optimizer_instance.max:
+             if self.verbose: print("Optimizer instance or its maximum not found. Cannot plot optimal feature values.")
+             optimal_params = None
+        else:
+             optimal_params = self._last_optimizer_instance.max.get('params', None)
+             if optimal_params is None and self.verbose: print("Warning: Could not retrieve optimal parameters found by the optimizer.")
 
-        fig, axs = plt.subplots(1, 2, figsize=(16, 6))
-        self._plot_feature_evolution_data(self.iteration_data, axs[0], title_suffix="(Last Run)")
-        # Pass self.comparison_max to the plotting helper
-        self._plot_performance_vs_max_data(self.best_value_history, self.comparison_max, axs[1],
-                                           title_suffix="(Last Run)")
+        num_feature_plots = self.dim; num_perf_plots = 1
+        total_plots = num_feature_plots + num_perf_plots
+        n_cols = min(plot_cols, total_plots)
+        n_rows = math.ceil(total_plots / n_cols)
+        fig, axs = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False)
 
-        # --- Add Max Value Comparison Text ---
+        for d in range(self.dim):
+            row = d // n_cols; col = d % n_cols; ax = axs[row, col]
+            optimal_val_d = None
+            if optimal_params:
+                try: optimal_val_d = optimal_params[f'x{d}']
+                except KeyError:
+                     if self.verbose: print(f"Warning: Optimal parameter 'x{d}' not found.")
+            # Call the single feature plotter (which includes optimal line)
+            self._plot_single_feature_convergence(
+                iteration_data=self.iteration_data, feature_index=d,
+                optimal_value=optimal_val_d, ax=ax, title_suffix="(Last Run)"
+            )
+
+        perf_plot_idx = self.dim; row = perf_plot_idx // n_cols; col = perf_plot_idx % n_cols
+        ax = axs[row, col]
+        self._plot_performance_vs_max_data(
+            best_value_history=self.best_value_history, comparison_max=self.comparison_max,
+            ax=ax, title_suffix="(Last Run)"
+        )
+
+        for i in range(total_plots, n_rows * n_cols):
+            row = i // n_cols; col = i % n_cols; axs[row, col].axis('off')
+
         gp_max_val_str = "N/A"
         if self._last_optimizer_instance and hasattr(self._last_optimizer_instance, 'max') and self._last_optimizer_instance.max:
              gp_max_val = self._last_optimizer_instance.max.get('target', 'N/A')
              if isinstance(gp_max_val, (float, np.float_)): gp_max_val_str = f"{gp_max_val:.4f}"
-
-        # Determine how the comparison max was obtained for labeling
         if self.known_true_max is not None:
-            comparison_label = "Known True Max:"
-            comparison_val_str = f"{self.comparison_max:.4f}" if self.comparison_max is not None else "N/A"
-            # Don't display sampled max if known max was used
-            sampled_max_line = ""
-        elif self.sampled_approx_max is not None: # Sampled value exists and was used
-            comparison_label = "Sampled Approx Max:"
-            comparison_val_str = f"{self.comparison_max:.4f}" # comparison_max holds the sampled value here
-            sampled_max_line = f"{comparison_label:<20} {comparison_val_str}\n"
-        else: # Should not happen if run completed, but handle defensively
-            comparison_label = "Comparison Max:"
-            comparison_val_str = "N/A"
-            sampled_max_line = f"{comparison_label:<20} {comparison_val_str}\n"
-
-        observed_max_str = f"{self.current_best_value:.4f}" if self.current_best_value > -np.inf else "N/A"
-
-        # Construct text, only including sampled line if relevant
-        max_info_text = ""
-        if self.known_true_max is not None:
-             max_info_text += f"{comparison_label:<20} {comparison_val_str}\n"
+            comparison_label = "Known True Max:"; comparison_val_str = f"{self.comparison_max:.4f}" if self.comparison_max is not None else "N/A"; sampled_max_line = ""
         elif self.sampled_approx_max is not None:
-             max_info_text += sampled_max_line # Already includes label and value
-
+            comparison_label = "Sampled Approx Max:"; comparison_val_str = f"{self.comparison_max:.4f}"; sampled_max_line = f"{comparison_label:<20} {comparison_val_str}\n"
+        else: comparison_label = "Comparison Max:"; comparison_val_str = "N/A"; sampled_max_line = f"{comparison_label:<20} {comparison_val_str}\n"
+        observed_max_str = f"{self.current_best_value:.4f}" if self.current_best_value > -np.inf else "N/A"
+        max_info_text = ""
+        if self.known_true_max is not None: max_info_text += f"{comparison_label:<20} {comparison_val_str}\n"
+        elif self.sampled_approx_max is not None: max_info_text += sampled_max_line
         max_info_text += (f"{'Observed Best Value:':<20} {observed_max_str}\n"
                           f"{'GP Estimated Max:':<20} {gp_max_val_str}")
-
-        plt.figtext(0.5, 0.97, max_info_text, ha="center", va="top", fontsize=9,
-                    bbox={"facecolor":"white", "alpha":0.7, "pad":3},
-                    family='monospace') # Use monospace for alignment
-        # --- End Text Addition ---
+        plt.figtext(0.5, 0.98, max_info_text, ha="center", va="top", fontsize=9,
+                    bbox={"facecolor":"white", "alpha":0.7, "pad":3}, family='monospace')
 
         acq_name, acq_param = self._get_acq_info(self.last_run_acquisition_fn)
         fig.suptitle(f"Bayesian Optimization Summary ({self.total_iterations} Iterations, Acq: {acq_name} {acq_param})",
-                     fontsize=16, y=1.03) # Slightly raise title
-        plt.tight_layout(rect=[0, 0.03, 1, 0.92]) # Adjust layout
+                     fontsize=16, y=1.0)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust top margin
 
         if save_plot:
-            full_filename = self._generate_filename(
-                base_name=save_filename, prefix="bayesopt_summary", directory=self.plot_dir
-            )
+            full_filename = self._generate_filename(base_name=save_filename, prefix="bayesopt_summary", directory=self.plot_dir)
             if self._ensure_dir_exists(full_filename):
                 try:
                     fig.savefig(full_filename, bbox_inches='tight', dpi=150)
@@ -564,5 +574,4 @@ class BayesOptimizer:
                     if self.verbose: print(f"Error saving summary plot to {full_filename}: {e}")
             else:
                  if self.verbose: print(f"Could not save plot, directory creation failed for {full_filename}")
-
         plt.show()
